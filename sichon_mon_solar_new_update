@@ -1,0 +1,1392 @@
+
+
+/*
+ NO COOL DOWN  NAKORNSRI work  OK NEW UPDATE AUTO MODE SHARE 34NANOSEC 
+ PREVENT RATE OF INVERTER IF OVER CURRENT CT SENSOR BYPASS TO PEA BY ATS 
+ SOLAR3FROM6_copy_4-22-2026_09:25:00  use LCD2004 20X4
+ -แก้: manualBoost ต้องชนะทุกเงื่อนไข auto
+ -แก้: เพิ่ม Serial แจ้งทุกครั้งที่เปลี่ยนสถานะ boost แจ้ง เป็น1 กับว่าง
+ -แก้: เน็ตล่มให้ LCD แจ้งเตือนบรรทัด 3 ระบบรัน Auto ได้ปกติ ไม่ใช้ while บล็อก
+ -แก้: เมนูตั้งค่ากดวนออกได้ ไม่ต้องเซฟ กดค้างออกทันที มี timeout 30วิ
+ -แก้: ล้าง retained saraphi/cmd/reboot ทั้งใน setup และ loop กันวนรีบูท
+ -ตั้งค่ามาดู และ ดึง อ่านค่า เหล่านี้ mul v1v2v3 vhightvlowv treshold ที่ เคย เขียนลงใน esp32 มา เซ็ตให้เป้นปัจจุบัณ
+  มี ดึงเวลาจาก ds3231 ในตัวแล้ว และ มี เพิ่มวอยด์จาก เมต้า เอไอ ให้ อีก 1 วอยด์ 
+  สาย SCT-013-030 เส้นที่ 1: ต่อเข้า "จุดกึ่งกลาง R 5K" (นี่คือ Virtual Ground ของเราที่ 1.65V)
+  สาย SCT-013-030 เส้นที่ 2: ต่อเข้า "Pin 33" ของ ESP32
+  กราวด์จริง (GND) ของ ESP32: ไม่ต้อง เอาสายจาก CT ไปต่อลงตรงนั้นครับ (ปล่อยให้มันลอยมาอ้างอิงที่จุด 1.65V แทน)
+  SCT-013-030  ต่อมา ได้เลย  เพราะเป็น  รุ่นที่มีซื้อรุ่น SCT-013-030 (ขนาด 30A) ไม่ต้องใส่ Burden Resistor มันออก 1โวลทให้ แล้ว 
+  ตั้งค่า ออฟเซ็ท temp NTCได้
+*/
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include "RTClib.h"
+#include <Adafruit_AHTX0.h>
+#include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
+#include <math.h>
+#include "PCF8574.h"
+#include <ArduinoJson.h> // ถ้ายังไม่มี
+
+PCF8574 pcf8574(0x20);
+
+static unsigned long lastRetry = 0;
+Preferences prefs;
+
+const int PIN_CT = 33;
+const int PIN_BOOST = 16;
+
+
+const float CT_RATIO = 30.0;
+const float PRE_CONNECT_A = 4.0;
+const int MAG_HOLD_MS = 15000;
+const float BATT_LOW_V = 48.0;
+
+const int PIN_LED_SUN = 12;// SHOW  USER   CURRENT FROM  SUN
+const int PIN_LED_PEA = 23;// SHOW  USER   CURRENT FROM  PEA
+
+const int PIN_RELAY_INIT_HIGH = 13;
+
+float currentAC = 0.0;
+bool magConnected = false;
+bool manualBoost = false;
+unsigned long magStart = 0;
+
+
+// --- ตัวแปร vbat reference  Hysteresis ที่จะโดนเปลี่ยนจาก Node-RED ---
+float vHighThreshold = 53.5; // HIGH ค่าเริ่มต้น: แบตถึงเท่านี้ตัดเข้า  SUN  >  MUL V BAT  = 27.30
+float vLowThreshold = 52.0;  // LOW  ค่าเริ่มต้น: แบตต่ำกว่าเท่านี้กลับ PEA  >  MUL V BAT  = 26.50
+
+float ctHighThreshold = 14.0; // HIGH ค่าเริ่มต้น: แบตถึงเท่านี้ตัดเข้า  SUN  >  MUL V BAT  = 14A
+float ctLowThreshold = 13.5;  // LOW  ค่าเริ่มต้น: แบตต่ำกว่าเท่านี้กลับ PEA  >  MUL V BAT  = 13.5A
+
+// --- Topic MQTT ที่ใช้รับค่า ---
+const char* TOPIC_VHIGH = "solar/set/vbat_high";//
+const char* TOPIC_VLOW = "solar/set/vbat_low";
+
+// --- Topic MQTT ที่ใช้รับค่า ---
+const char* TOPIC_CTHIGH = "solar/set/ct_high";//
+const char* TOPIC_CTLOW = "solar/set/ct_low";  //
+
+
+float vLowLimit = 205.0;
+float vHighLimit = 215.0;
+int startHH = 9, startMN = 0;
+int stopHH = 15, stopMN = 0;
+
+// <<< เพิ่ม 2 บรรทัดนี้ >>>
+unsigned long lastSensorRead = 0;  // จับเวลาอ่านเซ็นเซอร์
+unsigned long lastCheck = 0;       // จับเวลาเช็คสลับไฟ
+
+Adafruit_AHTX0 aht;
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+LiquidCrystal_I2C lcd2(0x26, 20, 4);
+RTC_DS3231 rtc;
+
+float NTC_OFFSET = 15.3; // ค่าชดเชย NTC ปรับจาก Node-RED ได้
+
+
+const int PIN_V1 = 36;
+const int PIN_V2 = 39;
+const int PIN_V3 = 34;
+const int NTC_Pin = 32;
+const int PIN_PEA = 4;
+const int PIN_INV = 5;
+
+const char* ssid = "3BB-Rachaneewan";
+const char* password = "0611987466";
+const char* server1 = "alldaygrow.tplinkdns.com";
+const char* server2 = "125.24.223.60";
+
+const int PIN_SET_MODE = 26;
+const int PIN_SET_UP = 27;
+const int PIN_SET_SAVE = 14;
+
+//const int PIN_BOOST = 16;        // รีเลย์  สั่ง  ปิดเปิด  ถ้ามี  ดีซี คอนแท็คเตอร์ 
+// const int PIN_MANUAL_SW = 25;    // สวิตช์แมนนวล
+// <<< ขาสำหรับ 6600 + Nema17 >>>
+//float acAmp = readCurrentAC();
+static bool breakerState = false; // จำสถานะไว้ กันสั่งซ้ำ
+bool lcdShowSun = false; // ประกาศไว้บนสุดของโปรแกรม เพื่อให้ใช้ได้ทุกที่
+
+const int PIN_STEP_PUL = 17;     // D17 -> PUL+
+const int PIN_STEP_DIR = 18;     // D18 -> DIR+
+const int PIN_STEP_ENA = 19;     // D19 -> ENA+  ใส่ ENA กันร้อน
+
+int setHH, setMN, setSC;
+int editState = 0;
+
+WiFiClient espClient01;
+WiFiClient espClient02;
+PubSubClient client(espClient01);
+PubSubClient client2(espClient02);
+
+bool manualState = false;
+int lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+bool isCooldown = false;
+unsigned long cooldownStart = 0;
+unsigned long lastMsg = 0;
+
+unsigned long lastRTCPing = 0;
+int confirmCount = 0;
+bool nextMode = true;
+bool gridMode = true;
+float v1, v2, v3, tempNTC;
+float MULT_V1 = 97.0;  //ค่าดีฟอลลท์
+float MULT_V2 = 21.0;  //ค่าดีฟอลลท์
+float MULT_V3 = 79.5;  //ค่าดีฟอลลท์
+
+float getValue(int pin, float multiplier) {
+  long sum = 0;
+  int samples = 150;
+  for(int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  return (sum / (float)samples * 3.3 / 4095.0) * multiplier;
+}
+
+// <<< ฟังก์ชันอ่านกระแสจาก CT >>>
+float readCurrentAC() {
+  long sum = 0;
+  int samples = 300;
+  for(int i = 0; i < samples; i++) {
+    int raw = analogRead(PIN_CT);
+    int val = raw - 2048;  // <<< จุดที่ 1: 2048 อาจไม่ตรง 0 จริง
+    sum += val * val;
+    delayMicroseconds(100);
+  }
+  float rms = sqrt(sum / (float)samples);
+  float voltage = rms * 3.3 / 4095.0;
+  float current = voltage * CT_RATIO;
+  
+  // <<< จุดที่ 2: ตัด noise floor ตรงนี้ >>>
+  //if (current < 0.5) {  // ถ้าต่ำกว่า 0.5A ให้เป็น 0
+  //  current = 0.0;
+  //}
+  
+  return current;
+}
+
+//หรือ 1-2k) ที่มีค่า Beta 3950  -40°C ถึง +125°C
+void readSensors() {
+  v1 = getValue(PIN_V1, MULT_V1);
+  v2 = getValue(PIN_V2, MULT_V2);
+  v3 = getValue(PIN_V3, MULT_V3);
+  int rawNTC = analogRead(NTC_Pin);
+  if (rawNTC < 4095 && rawNTC > 100) {
+    float v_ratio = rawNTC / 4095.0;
+    float R_ntc = 2000.0 * (v_ratio / (1.0 - v_ratio));
+    float tempK = 1.0 / (1.0/298.15 + (log(R_ntc/2000.0) / 3950.0));
+    tempNTC = (tempK - 273.15) + NTC_OFFSET; // <<< แก้บรรทัดนี้ จาก 15.3 เป็น NTC_OFFSET
+  }
+  DateTime now = rtc.now();
+  Serial.printf("v1:%.1f, v2:%.1f, v3:%.1f, T:%.1f, :%02d:%02d:%02d\n", v1, v2, v3, tempNTC, now.hour(), now.minute(), now.second());
+}
+
+
+
+/*
+เก่า
+void readSensors() {
+  v1 = getValue(PIN_V1, MULT_V1);
+  v2 = getValue(PIN_V2, MULT_V2);
+  v3 = getValue(PIN_V3, MULT_V3);
+  int rawNTC = analogRead(NTC_Pin);
+  if (rawNTC < 4095 && rawNTC > 100) {
+    float v_ratio = rawNTC / 4095.0;
+    float R_ntc = 2000.0 * (v_ratio / (1.0 - v_ratio));
+    float tempK = 1.0 / (1.0/298.15 + (log(R_ntc/2000.0) / 3950.0));
+    tempNTC = (tempK - 273.15) + 15.3;
+  }
+  DateTime now = rtc.now();
+  Serial.printf("v1:%.1f, v2:%.1f, v3:%.1f, T:%.1f, :%02d:%02d:%02d\n", v1, v2, v3, tempNTC, now.hour(), now.minute(), now.second());
+}
+*/
+
+void checkManualButton() {
+  int currentButtonState = digitalRead(25);
+  if (currentButtonState == LOW && lastButtonState == HIGH) {
+    if (millis() - lastDebounceTime > 200) {
+      if (manualState == false) {
+        manualState = true;
+        isCooldown = false;
+        digitalWrite(PIN_PEA, LOW); delay(100);
+        digitalWrite(PIN_INV, HIGH);
+        gridMode = false;
+      } else {
+        if (gridMode == false) {
+          digitalWrite(PIN_INV, LOW); delay(100);
+          digitalWrite(PIN_PEA, HIGH);
+          gridMode = true;
+        } else {
+          digitalWrite(PIN_PEA, LOW); delay(100);
+          digitalWrite(PIN_INV, HIGH);
+          gridMode = false;
+        }
+      }
+      lastDebounceTime = millis();
+    }
+  }
+  lastButtonState = currentButtonState;
+}
+
+// <<< แก้ reconnect ให้ subscribe ครบทุก topic ที่ต้องใช้
+void reconnect() {
+  if (millis() - lastRetry > 5000) {
+    lastRetry = millis();
+
+    //lcd.clear();
+
+    if (!client.connected()) {
+      if (client.connect("ESP32_saraphi_01")) {
+        Serial.println("MQ.OK");
+        client.loop();
+
+        // <<< ล้าง retained เดิม >>>
+        client.publish("saraphi/set/v1", "", true);
+        client.publish("saraphi/set/v2", "", true);
+        client.publish("saraphi/set/v3", "", true);
+        client.publish("saraphi/set/v1_low", "", true);
+        client.publish("saraphi/set/v1_high", "", true);
+        client.publish("solar/set/vbat_high", "", true);
+        client.publish("solar/set/vbat_low", "", true);
+
+        client.publish("solar/set/ct_high", "", true);
+        client.publish("solar/set/ct_low", "", true);
+
+       // const char* TOPIC_CTHIGH = "solar/set/ct_high";//
+       // const char* TOPIC_CTLOW = "solar/set/ct_low";  //
+        client.publish("saraphi/cmd/reboot", "", true);
+        client.publish("saraphi/cmd/manual", "", true);
+        client.publish("saraphi/cmd/boost", "", true);
+        client.publish("saraphi/set/rtc_time", "", true);
+
+        delay(100);
+
+        client.subscribe("saraphi/cmd/reboot");
+        client.subscribe("saraphi/cmd/boost");
+        client.subscribe("saraphi/cmd/manual");
+        client.subscribe("saraphi/set/v1");
+        client.subscribe("saraphi/set/v2");
+        client.subscribe("saraphi/set/v3");
+
+        client.subscribe("saraphi/set/v1_low");
+        client.subscribe("saraphi/set/v1_high");
+        client.subscribe("solar/set/vbat_high");
+        client.subscribe("solar/set/vbat_low");
+
+        client.subscribe("solar/set/ct_high");
+        client.subscribe("solar/set/ct_low");
+
+
+        client.subscribe("saraphi/set/time_start");
+        client.subscribe("saraphi/set/time_stop");
+        client.subscribe("saraphi/set/ntc_offset");
+        client.subscribe("saraphi/set/rtc_time");
+
+        // <<< ส่งค่าปัจจุบันกลับไปให้ Node-RED แสดง >>>
+        delay(100);
+        client.publish("saraphi/set/v1_high", String(vHighLimit).c_str(), true);
+        client.publish("saraphi/set/v1_low", String(vLowLimit).c_str(), true);
+        client.publish("solar/set/vbat_high", String(vHighThreshold).c_str(), true); // แก้แล้ว
+        client.publish("solar/set/vbat_low", String(vLowThreshold).c_str(), true);   // แก้แล้ว
+
+        client.publish("solar/set/ct_high", String(ctHighThreshold).c_str(), true); // แก้แล้ว
+        client.publish("solar/set/ct_low", String(ctLowThreshold).c_str(), true);   // แก้แล้ว
+
+        client.publish("saraphi/set/v1", String(MULT_V1).c_str(), true);
+        client.publish("saraphi/set/v2", String(MULT_V2).c_str(), true);
+        client.publish("saraphi/set/v3", String(MULT_V3).c_str(), true);
+        client.publish("saraphi/set/ntc_offset", String(NTC_OFFSET).c_str(), true);
+        Serial.println(">>> Sent current settings to MQTT");
+      }
+    }
+
+    // ทำเหมือนกันกับ client2
+    if (!client2.connected()) {
+      if (client2.connect("ESP32_saraphi_02")) {
+        Serial.println("MQTT2 OK");
+        client2.loop();
+
+        client2.publish("saraphi/set/v1", "", true);
+        client2.publish("saraphi/set/v2", "", true);
+        client2.publish("saraphi/set/v3", "", true);
+        client2.publish("saraphi/set/v1_low", "", true);
+        client2.publish("saraphi/set/v1_high", "", true);
+        client2.publish("solar/set/vbat_high", "", true);
+        client2.publish("solar/set/vbat_low", "", true);
+
+        
+        client2.publish("solar/set/ct_high", "", true);
+        client2.publish("solar/set/ct_low", "", true);
+
+        client2.publish("saraphi/cmd/reboot", "", true);
+        client2.publish("saraphi/cmd/manual", "", true);
+        client2.publish("saraphi/cmd/boost", "", true);
+        client2.publish("saraphi/set/rtc_time", "", true);
+
+        delay(100);
+
+        client2.subscribe("saraphi/cmd/reboot");
+        client2.subscribe("saraphi/cmd/boost");
+        client2.subscribe("saraphi/cmd/manual");
+        client2.subscribe("saraphi/set/v1");
+        client2.subscribe("saraphi/set/v2");
+        client2.subscribe("saraphi/set/v3");
+        client2.subscribe("saraphi/set/v1_low");
+        client2.subscribe("saraphi/set/v1_high");
+        client2.subscribe("solar/set/vbat_high");
+        client2.subscribe("solar/set/vbat_low");
+
+        client2.subscribe("solar/set/ct_high");
+        client2.subscribe("solar/set/ct_low");
+
+        client2.subscribe("saraphi/set/time_start");
+        client2.subscribe("saraphi/set/time_stop");
+        client2.subscribe("saraphi/set/ntc_offset");
+        client2.subscribe("saraphi/set/rtc_time");
+
+        delay(100);
+        client2.publish("saraphi/set/v1_high", String(vHighLimit).c_str(), true);
+        client2.publish("saraphi/set/v1_low", String(vLowLimit).c_str(), true);
+        client2.publish("solar/set/vbat_high", String(vHighThreshold).c_str(), true); // แก้บรรทัดนี้
+        client2.publish("solar/set/vbat_low", String(vLowThreshold).c_str(), true);   // แก้บรรทัดนี้
+      }
+    }
+  }
+}
+void runAutoSystem() {
+  unsigned long currentMillis = millis();
+  DateTime now = rtc.now();
+
+  long startSec = startHH * 3600L + startMN * 60L;
+  long stopSec = stopHH * 3600L + stopMN * 60L;
+  long nowSec = now.hour() * 3600L + now.minute() * 60L + now.second();
+
+  if (nowSec < startSec || nowSec >= stopSec) {
+    nextMode = true;
+    isCooldown = false;
+    confirmCount = 0;
+    Serial.println(">>> [TIME]: OUT OF SCHEDULE, FORCE PEA <<<");
+  }
+  else {
+    if (isCooldown) {
+      if (currentMillis - cooldownStart >= 60000) {//60000 =1  MIN OR  300000=5MIN
+        isCooldown = false;
+        Serial.println(">>> [INFO]: COOLDOWN FINISHED! <<<");
+      } else {
+        nextMode = true;
+        if (currentMillis % 3000 < 50) {
+          float remainMin = (60000 - (currentMillis - cooldownStart)) / 60000.0;
+          Serial.printf(">>> [STATUS]: COOLDOWN REMAIN: %.1f MIN <<<\n", remainMin);
+        }
+      }
+    } else {
+      if (v1 < vLowLimit) {
+        nextMode = true;
+        isCooldown = true;
+        cooldownStart = currentMillis;
+        Serial.println(">>> [EVENT]: V1 DROP! START 5 MIN COOLDOWN <<<");
+      } else if (v1 > vHighLimit) {
+        nextMode = false;
+        confirmCount = 0;
+      }
+    }
+  }
+
+  if (nextMode!= gridMode) {
+    if (nextMode == false) {
+     // digitalWrite(PIN_PEA, LOW); delay(100);
+     // digitalWrite(PIN_INV, HIGH);
+      gridMode = false;
+     // Serial.println(">>> [ACTION]: SWITCH TO INV <<<");
+    } else {
+    //  digitalWrite(PIN_INV, LOW); delay(100);
+    //  digitalWrite(PIN_PEA, HIGH);
+      gridMode = true;
+    //  Serial.println(">>> [ACTION]: SWITCH TO PEA <<<");
+    }
+  }
+}
+
+
+
+void setRtcFromMqtt(String msg) {
+  int hh = -1, mm = -1, ss = 0;
+  msg.trim();
+
+  if (msg.startsWith("{")) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, msg);
+    if (!err) {
+      hh = doc["hh"] | -1;
+      mm = doc["mm"] | -1;
+      ss = doc["ss"] | 0;
+    }
+  } else if (msg.indexOf(":") >= 0) {
+    sscanf(msg.c_str(), "%d:%d:%d", &hh, &mm, &ss);
+  }
+
+  if (hh >= 0 && hh < 24 && mm >= 0 && mm < 60 && ss >= 0 && ss < 60) {
+    DateTime now = rtc.now();
+    rtc.adjust(DateTime(now.year(), now.month(), now.day(), hh, mm, ss));
+    
+    Serial.printf(">>> [MQTT]: RTC SET %02d:%02d:%02d <<<\n", hh, mm, ss);
+    publishRTCTime();
+
+    lcd.clear();
+    lcd.setCursor(0,0); lcd.print("MQTT RTC SET");
+    lcd.setCursor(0,1); lcd.printf("%02d:%02d:%02d", hh, mm, ss);
+    delay(300);
+    lcd.clear();
+  } else {
+    Serial.println(">>> [MQTT]: RTC format invalid");
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  float newVal = msg.toFloat();
+  Serial.printf("MQTT Recv Topic: %s, Msg: %s\n", topic, msg.c_str());
+
+  // 1. จูนค่า V1/V2/V3/VLow/VHigh + Threshold แบต
+  if (String(topic) == "saraphi/set/v1") {
+    MULT_V1 = newVal;
+    prefs.begin("solar_cal", false);
+    prefs.putFloat("v1_cal", MULT_V1);
+    prefs.putBool("cfg_ok", true);
+    prefs.end();
+    Serial.printf(">>> SAVED V1: %.1f\n", MULT_V1);
+  }
+  else if (String(topic) == "saraphi/set/v2") {
+    MULT_V2 = newVal;
+    prefs.begin("solar_cal", false);
+    prefs.putFloat("v2_cal", MULT_V2);
+    prefs.putBool("cfg_ok", true);
+    prefs.end();
+    Serial.printf(">>> SAVED V2: %.1f\n", MULT_V2);
+  }
+  else if (String(topic) == "saraphi/set/v3") {
+    MULT_V3 = newVal;
+    prefs.begin("solar_cal", false);
+    prefs.putFloat("v3_cal", MULT_V3);
+    prefs.putBool("cfg_ok", true);
+    prefs.end();
+    Serial.printf(">>> SAVED V3: %.1f\n", MULT_V3);
+  }
+  else if (String(topic) == "saraphi/set/v1_low") {
+    vLowLimit = newVal;
+    prefs.begin("solar_cal", false);
+    prefs.putFloat("vLow", vLowLimit);
+    prefs.putBool("cfg_ok", true);
+    prefs.end();
+    Serial.printf(">>> SAVED vLowLimit: %.1f\n", vLowLimit);
+  }
+  else if (String(topic) == "saraphi/set/v1_high") {
+    vHighLimit = newVal;
+    prefs.begin("solar_cal", false);
+    prefs.putFloat("vHigh", vHighLimit);
+    prefs.putBool("cfg_ok", true);
+    prefs.end();
+    Serial.printf(">>> SAVED vHighLimit: %.1f\n", vHighLimit);
+  }
+ else if (String(topic) == "solar/set/vbat_high") {
+    vHighThreshold = newVal;
+    prefs.begin("solar_cal", false);
+    prefs.putFloat("vHighTh", vHighThreshold);
+    prefs.putBool("cfg_ok", true);
+    prefs.end();
+    Serial.printf(">>> SAVED vHighTh: %.1f\n", vHighThreshold);
+    return;
+  }
+
+
+  else if (String(topic) == "solar/set/ct_high") {
+    ctHighThreshold = newVal;
+    prefs.begin("solar_cal", false);
+    prefs.putFloat("CTHighTh", ctHighThreshold);
+    prefs.putBool("cfg_ok", true);
+    prefs.end();
+    Serial.printf(">>> SAVED CTHighTh: %.1f\n", ctHighThreshold);
+    return;
+  }
+  else if (String(topic) == "solar/set/ct_low") {
+    ctLowThreshold = newVal;
+    prefs.begin("solar_cal", false);
+    prefs.putFloat("CTLowTh", ctLowThreshold);
+    prefs.putBool("cfg_ok", true);
+    prefs.end();
+    Serial.printf(">>> SAVED CTLowTh: %.1f\n", ctLowThreshold);
+    return;
+  }
+
+  // 2. รับเวลาจาก Node-RED "09:30"
+  if (String(topic) == "saraphi/set/time_start") {
+    int h = msg.substring(0, 2).toInt();
+    int m = msg.substring(3, 5).toInt();
+    if (h >= 0 && h < 24 && m >= 0 && m < 60) {
+      startHH = h;
+      startMN = m;
+      prefs.begin("solar_cal", false);
+      prefs.putInt("sHH", startHH);
+      prefs.putInt("sMN", startMN);
+      prefs.putBool("cfg_ok", true);
+      prefs.end();
+      Serial.printf(">>> SAVED TIME START: %02d:%02d\n", startHH, startMN);
+    }
+    return;
+  }
+
+  if (String(topic) == "saraphi/set/time_stop") {
+    int h = msg.substring(0, 2).toInt();
+    int m = msg.substring(3, 5).toInt();
+    if (h >= 0 && h < 24 && m >= 0 && m < 60) {
+      stopHH = h;
+      stopMN = m;
+      prefs.begin("solar_cal", false);
+      prefs.putInt("tHH", stopHH);
+      prefs.putInt("tMN", stopMN);
+      prefs.putBool("cfg_ok", true);
+      prefs.end();
+      Serial.printf(">>> SAVED TIME STOP: %02d:%02d\n", stopHH, stopMN);
+      publishTimeStatus();
+    }
+    return;
+  }
+
+  if (String(topic) == "saraphi/set/ntc_offset") {
+    NTC_OFFSET = newVal;
+    prefs.begin("solar_cal", false);
+    prefs.putFloat("ntc_off", NTC_OFFSET);
+    prefs.putBool("cfg_ok", true);
+    prefs.end();
+    Serial.printf(">>> SAVED NTC_OFFSET: %.1f\n", NTC_OFFSET);
+    return;
+  }
+
+  if (String(topic) == "saraphi/set/rtc_time") {
+    setRtcFromMqtt(msg);
+    return;
+  }
+
+  if (String(topic) == "saraphi/cmd/boost") {
+    if (msg == "1" || msg == "ON" || msg == "on") {
+      manualBoost = true;
+      digitalWrite(PIN_BOOST, HIGH);
+      magConnected = true;
+      Serial.println(">>> [BOOST]: MANUAL BOOST = 1 (FORCE ON) <<<");
+    } else {
+      manualBoost = false;
+      digitalWrite(PIN_BOOST, LOW);
+      magConnected = false;
+      Serial.println(">>> [BOOST]: MANUAL BOOST = 0 (AUTO) <<<");
+    }
+    client.publish("saraphi/status/manual_boost", manualBoost? "1" : "0", true);
+    client2.publish("saraphi/status/manual_boost", manualBoost? "1" : "0", true);
+    return;
+  }
+
+  // 3. คำสั่ง Reboot
+  if (String(topic) == "saraphi/cmd/reboot" && msg == "1") {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("MQTT REBOOT CMD");
+    delay(1000);
+    ESP.restart();
+  }
+
+  else if (String(topic) == "saraphi/cmd/manual") {
+  if (msg == "SW1ON") {
+    digitalWrite(PIN_PEA, HIGH); delay(100);
+    client.publish("saraphi/status/SW1", "ON", true);
+    client2.publish("saraphi/status/SW1", "ON", true);
+  }
+  else if (msg == "SW1OFF") {
+    digitalWrite(PIN_PEA, LOW);
+    client.publish("saraphi/status/SW1", "OFF", true);
+    client2.publish("saraphi/status/SW1", "OFF", true);
+  }
+  else if (msg == "SW2ON") {
+    digitalWrite(PIN_INV, HIGH);
+    client.publish("saraphi/status/SW2", "ON", true);
+    client2.publish("saraphi/status/SW2", "ON", true);
+  }
+  else if (msg == "SW2OFF") {
+    digitalWrite(PIN_INV, LOW);
+    client.publish("saraphi/status/SW2", "OFF", true);
+    client2.publish("saraphi/status/SW2", "OFF", true);
+  }
+
+  showmode(); // แสดงผลบน LCD ตามสถานะ
+}
+
+
+}
+
+void publishTimeStatus() {
+  char buf[6];
+  sprintf(buf, "%02d:%02d", startHH, startMN);
+  client.publish("saraphi/status/time_start_now", buf, true); // retain=true ให้ค้างใน dashboard
+  client2.publish("saraphi/status/time_start_now", buf, true);
+
+  sprintf(buf, "%02d:%02d", stopHH, stopMN);
+  client.publish("saraphi/status/time_stop_now", buf, true);
+  client2.publish("saraphi/status/time_stop_now", buf, true);
+}
+
+void publishMULV123() {
+  // แปลงค่า float เป็น String แล้วส่งออกไป
+  client.publish("saraphi/status/MULV1", String(MULT_V1).c_str());
+  client2.publish("saraphi/status/MULV1", String(MULT_V1).c_str());
+  
+  client.publish("saraphi/status/MULV2", String(MULT_V2).c_str());
+  client2.publish("saraphi/status/MULV2", String(MULT_V2).c_str());
+  
+  client.publish("saraphi/status/MULV3", String(MULT_V3).c_str());
+  client2.publish("saraphi/status/MULV3", String(MULT_V3).c_str());
+}
+
+
+
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  lcd.init(); lcd.backlight();
+  lcd2.init();
+  lcd2.backlight();
+
+  lcd2.setCursor(0,0);
+  lcd2.print("LCD2 OK 0x26");
+  rtc.begin();
+
+  pcf8574.pinMode(P0, OUTPUT);
+  pcf8574.begin();
+  pcf8574.digitalWrite(P0, HIGH);
+
+  pinMode(PIN_RELAY_INIT_HIGH, OUTPUT);
+  digitalWrite(PIN_RELAY_INIT_HIGH, HIGH);
+
+  pinMode(PIN_V1, INPUT);
+  pinMode(PIN_V2, INPUT);
+  pinMode(PIN_V3, INPUT);
+  pinMode(NTC_Pin, INPUT);
+  pinMode(PIN_CT, INPUT);
+
+  pinMode(PIN_PEA, OUTPUT);
+  pinMode(PIN_INV, OUTPUT);
+  pinMode(PIN_BOOST, OUTPUT);
+  digitalWrite(PIN_BOOST, LOW);
+
+  pinMode(PIN_LED_SUN, OUTPUT);   // PIN 12 SHOW  USE   CURRENT FROM  SUN
+  pinMode(PIN_LED_PEA, OUTPUT);   // PIN 23 SHOW  USE   CURRENT FROM  PEA
+
+  pinMode(PIN_STEP_PUL, OUTPUT);  // =============  tb6600  control 
+  pinMode(PIN_STEP_DIR, OUTPUT);
+  pinMode(PIN_STEP_ENA, OUTPUT);
+  
+  digitalWrite(PIN_STEP_PUL, LOW);   // initial pin 
+  digitalWrite(PIN_STEP_DIR, LOW);
+  digitalWrite(PIN_STEP_ENA, HIGH); // HIGH = Disable ไว้ก่อน ไม่ให้ร้อน
+
+  pinMode(25, INPUT_PULLUP);
+  pinMode(PIN_SET_MODE, INPUT_PULLUP);
+  pinMode(PIN_SET_UP, INPUT_PULLUP);
+  pinMode(PIN_SET_SAVE, INPUT_PULLUP);
+
+  // --- ดึงค่าตัวคูณจากบ้าน solar_cal ---
+  prefs.begin("solar_cal", false);
+  MULT_V1 = prefs.getFloat("v1_cal", MULT_V1);
+  MULT_V2 = prefs.getFloat("v2_cal", MULT_V2);
+  MULT_V3 = prefs.getFloat("v3_cal", MULT_V3);
+  prefs.end();
+
+
+  // เคลียร์ค่าเก่าที่ค้างใน broker
+client.publish("saraphi/status/boost2", "", true);
+client2.publish("saraphi/status/boost2", "", true);
+delay(200);
+
+// แล้วยิง ON ค้างไว้เลย
+client.publish("saraphi/status/boost2", "ON", true);
+client2.publish("saraphi/status/boost2", "ON", true);
+
+
+prefs.begin("solar_cal", true); // true = read-only
+bool cfgOK = prefs.getBool("cfg_ok", false);
+
+if (cfgOK) {
+  MULT_V1 = prefs.getFloat("v1_cal", 97.0);
+  MULT_V2 = prefs.getFloat("v2_cal", 21.0);
+  MULT_V3 = prefs.getFloat("v3_cal", 79.5);
+  vLowLimit = prefs.getFloat("vLow", 205.0);
+  vHighLimit = prefs.getFloat("vHigh", 215.0);
+  NTC_OFFSET = prefs.getFloat("ntc_off", 15.3);
+
+  vHighThreshold = prefs.getFloat("vHighTh", 53.9);   // เพิ่มบรรทัดนี้
+  vLowThreshold = prefs.getFloat("vLowTh", 52.2);     // เพิ่มบรรทัดนี้
+
+  Serial.println(">>> [BOOT]: Load config from NVS OK");
+} else {
+  Serial.println(">>> [BOOT]: NVS CORRUPT! Use default value");
+  // ใช้ค่า default ที่ประกาศไว้หัวไฟล์
+}
+startHH = prefs.getInt("sHH", 9);
+startMN = prefs.getInt("sMN", 0);
+stopHH = prefs.getInt("tHH", 15);
+stopMN = prefs.getInt("tMN", 0);
+prefs.end();
+  readSensors();
+  DateTime now = rtc.now();
+  int bootTime = (now.hour() * 100) + now.minute();
+  int startTimeSet = startHH * 100 + startMN;
+  int stopTimeSet = stopHH * 100 + stopMN;
+
+  if (bootTime >= startTimeSet && bootTime <= stopTimeSet && v1 > vHighLimit) {
+    //digitalWrite(PIN_PEA, LOW); delay(500); digitalWrite(PIN_INV, HIGH);
+    gridMode = false;
+  } else {
+    //digitalWrite(PIN_INV, LOW); delay(500); digitalWrite(PIN_PEA, HIGH);
+    //gridMode = true;
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.println(">>> [BOOT]: WiFi connecting... <<<");
+
+  client.setServer(server1, 1883);
+  client2.setServer(server2, 16832);
+  client.setCallback(callback);
+  client2.setCallback(callback);
+
+  // <<< แก้: ต่อแล้ว subscribe ทันที รอรับค่าจาก Node-RED ก่อนเข้า loop
+  if (WiFi.status() == WL_CONNECTED) {
+    reconnect(); // เรียก reconnect ครั้งแรกให้มัน subscribe เลย
+    for(int i=0; i<10; i++){ // loop รอรับ retained message 1 วิ
+      client.loop();
+      client2.loop();
+      delay(100);
+    }
+  }
+
+  Serial.println(">>> [BOOT]: Setup done, entering loop <<<");
+  publishTimeStatus();
+
+
+  
+  breakerState = true;          // อัปเดตสถานะว่าตอนนี้สลับมาไฟหลวงแล้ว
+
+}
+
+
+
+
+//ควบคุม TB 6600 ลากเบรคเกอร์ ดีซี 
+void breakerOn() {
+  digitalWrite(PIN_STEP_ENA, LOW);  // Enable มอเตอร์
+  delay(5); // รอให้ไดรฟ์พร้อม
+  digitalWrite(PIN_STEP_DIR, HIGH); // หมุนทาง ON
+  
+  for(int i=0; i<400; i++){
+    digitalWrite(PIN_STEP_PUL, HIGH);
+    delayMicroseconds(600);
+    digitalWrite(PIN_STEP_PUL, LOW);
+    delayMicroseconds(600);
+  }
+  
+  delay(100); // รอให้หยุดนิ่ง
+  digitalWrite(PIN_STEP_ENA, HIGH); // Disable ปล่อยฟรี ไม่ร้อน
+}
+
+void breakerOff() {
+  digitalWrite(PIN_STEP_ENA, LOW);  // Enable มอเตอร์
+  delay(5);
+  digitalWrite(PIN_STEP_DIR, LOW);  // หมุนทาง OFF
+  
+  for(int i=0; i<400; i++){
+    digitalWrite(PIN_STEP_PUL, HIGH);
+    delayMicroseconds(600);
+    digitalWrite(PIN_STEP_PUL, LOW);
+    delayMicroseconds(600);
+  }
+  
+  delay(100);
+  digitalWrite(PIN_STEP_ENA, HIGH); // Disable ปล่อยฟรี
+}
+
+
+
+
+void publishRTCTime() {
+  DateTime now = rtc.now();
+  char buf[20];
+  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+
+  client.publish("saraphi/status/rtc_time", buf, true); // retain=true ค้างไว้ใน dashboard
+  client2.publish("saraphi/status/rtc_time", buf, true);
+  Serial.printf(">>> PUB RTC: %s\n", buf);
+}
+
+void handleTimeSetting() {
+  static unsigned long pressStart = 0;
+  static bool wasLongPress = false;
+  static unsigned long lastActivity = 0;
+
+  if (editState > 0 && millis() - lastActivity > 30000) {
+    editState = 0;
+    setHH = 0; setMN = 0; setSC = 0;
+    lcd.clear();
+    Serial.println(">>> [MENU]: TIMEOUT -> EXIT <<<");
+    return;
+  }
+
+  if (digitalRead(PIN_SET_MODE) == LOW) {
+    if (pressStart == 0) {
+      pressStart = millis();
+      wasLongPress = false;
+      lastActivity = millis();
+    }
+    if (!wasLongPress && millis() - pressStart > 2000 && editState > 0) {
+      wasLongPress = true;
+      editState = 0;
+      setHH = 0; setMN = 0; setSC = 0;
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print("EXIT NO SAVE");
+      delay(2000);
+      lcd.clear();
+      Serial.println(">>> [MENU]: LONG PRESS -> EXIT NO SAVE <<<");
+      while(digitalRead(PIN_SET_MODE) == LOW) delay(10);
+    }
+    if (!wasLongPress && millis() - pressStart > 2000 && editState == 0) {
+      wasLongPress = true;
+      editState = 6;
+      startMN = 0;
+      lcd.clear();
+      Serial.println(">>> [MENU]: LONG PRESS -> START:HOUR <<<");
+      while(digitalRead(PIN_SET_MODE) == LOW) delay(10);
+    }
+  } else {
+    if (pressStart > 0) {
+      if (!wasLongPress && millis() - pressStart > 50) {
+        lastActivity = millis();
+        if (editState == 0) {
+          editState = 1;
+          DateTime now = rtc.now();
+          setHH = now.hour(); setMN = now.minute(); setSC = now.second();
+          lcd.clear();
+          Serial.println(">>> [MENU]: SHORT PRESS -> CLOCK SETTING <<<");
+        } else {
+          editState++;
+          if (editState > 10) {
+            editState = 0;
+            setHH = 0; setMN = 0; setSC = 0;
+            lcd.clear();
+            Serial.println(">>> [MENU]: CIRCLE END -> EXIT NO SAVE <<<");
+          } else {
+            if (editState == 7) stopMN = 0;
+            lcd.clear();
+          }
+        }
+      }
+    }
+    pressStart = 0;
+    wasLongPress = false;
+  }
+
+  if (editState > 0) {
+    lastActivity = millis();
+
+    if (digitalRead(PIN_SET_UP) == LOW) {
+      lastActivity = millis();
+      switch(editState) {
+        case 1: setHH++; if(setHH > 23) setHH = 0; break;
+        case 2: setMN++; if(setMN > 59) setMN = 0; break;
+        case 3: setSC++; if(setSC > 59) setSC = 0; break;
+        case 4: vLowLimit += 0.5; break;
+        case 5: vHighLimit += 0.5; break;
+        case 6: startHH++; if(startHH > 23) startHH = 0; break;
+        case 7: startMN++; if(startMN > 59) startMN = 0; break;
+        case 8: stopHH++; if(stopHH > 23) stopHH = 0; break;
+        case 9: stopMN++; if(stopMN > 59) stopMN = 0; break;
+      }
+      delay(100);
+    }
+
+    if (digitalRead(PIN_SET_SAVE) == LOW) {
+      delay(50);
+      lastActivity = millis();
+      if (editState <= 9) {
+        switch(editState) {
+          case 1: setHH--; if(setHH < 0) setHH = 23; break;
+          case 2: setMN--; if(setMN < 0) setMN = 59; break;
+          case 3: setSC--; if(setSC < 0) setSC = 59; break;
+          case 4: vLowLimit -= 0.5; break;
+          case 5: vHighLimit -= 0.5; break;
+          case 6: startHH--; if(startHH < 0) startHH = 23; break;
+          case 7: startMN--; if(startMN < 0) startMN = 59; break;
+          case 8: stopHH--; if(stopHH < 0) stopHH = 23; break;
+          case 9: stopMN--; if(stopMN < 0) stopMN = 59; break;
+        }
+        delay(150);
+      }
+      else if (editState == 10) {
+        if (setHH!= 0 || setMN!= 0 || setSC!= 0) {
+          DateTime current = rtc.now();
+          rtc.adjust(DateTime(current.year(), current.month(), current.day(), setHH, setMN, setSC));
+        }
+        prefs.begin("solar_cal", false);
+        prefs.putFloat("vLow", vLowLimit);
+        prefs.putFloat("vHigh", vHighLimit);
+        prefs.putInt("sHH", startHH);
+        prefs.putInt("sMN", startMN);
+        prefs.putInt("tHH", stopHH);
+        prefs.putInt("tMN", stopMN);
+        prefs.putBool("cfg_ok", true);
+        prefs.end();
+        publishTimeStatus(); // <<< เพิ่มบรรทัดนี้ ส่งเวลาไป Node-RED ทันที
+
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print(" TIME UPDATED ");
+        lcd.setCursor(0, 1); lcd.printf("%02d:%02d-%02d:%02d", startHH, startMN, stopHH, stopMN);
+        delay(1000);
+        editState = 0; setHH = 0; setMN = 0; setSC = 0;
+        lcd.clear();
+        while(digitalRead(PIN_SET_SAVE) == LOW) delay(10);
+      }
+    }
+
+    lcd.setCursor(0, 0);
+    switch(editState) {
+      case 1: lcd.print("1.SET:HH BUTT.UP-DWN"); break;
+      case 2: lcd.print("2.SET:MM BUTT.UP-DWN"); break;
+      case 3: lcd.print("3.SET:SS BUTT.UP-DWN"); break;
+      case 4: lcd.printf("4.SET:V-INV LO %.1fV ", vLowLimit); break;
+      case 5: lcd.printf("5.SET:V-INV HI %.1fV ", vHighLimit); break;
+      case 6: lcd.printf("6.START:HOUR %02d ", startHH); break;
+      case 7: lcd.printf("7.START:MIN %02d ", startMN); break;
+      case 8: lcd.printf("8.STOP :HOUR %02d ", stopHH); break;
+      case 9: lcd.printf("9.STOP :MIN %02d ", stopMN); break;
+      case 10: lcd.print("10.PRESS BUTTON SAVE"); break;//BUTT PIN14  TO SAVE
+    }
+    lcd.setCursor(0, 1);
+    if (editState <= 3) lcd.printf("VAL: %02d:%02d:%02d ", setHH, setMN, setSC);
+    else if (editState <= 5) lcd.printf("ADJ: %.1fV [M]EXIT", (editState == 4? vLowLimit : vHighLimit));
+    else if (editState <= 9) lcd.printf("ADJ: %02d:%02d [M]EXIT", (editState <= 7? startHH : stopHH), (editState == 7? startMN : stopMN));
+    else lcd.printf("%02d:%02d-%02d:%02d ", startHH, startMN, stopHH, stopMN);
+
+    lcd.setCursor(0,2);
+    lcd.print("HOLD [M]2s=CANCEL ");
+  }
+}
+
+void view_value2() {
+  if (digitalRead(PIN_SET_UP) == LOW && editState == 0) {
+    lcd.clear();
+    while (digitalRead(PIN_SET_UP) == LOW) {
+      char bL[10], bH[10];
+      dtostrf(vLowLimit, 1, 1, bL);
+      dtostrf(vHighLimit, 1, 1, bH);
+      client.publish("saraphi/status/v1_low_now", bL);
+      client.publish("saraphi/status/v1_high_now", bH);
+
+      //lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.printf("SYSTEM BY PATHOMPONG");
+      lcd.setCursor(0, 1);
+      lcd.printf("TYPE:   NO COOL DOWN");
+      //lcd.printf("SYSTEM NO COOL DOWN");
+      lcd.setCursor(0, 2);
+      lcd.printf("L:%.1f H:%.1f", vLowLimit, vHighLimit);
+      lcd.setCursor(0, 3);
+      lcd.printf("ST%02d:%02d SP%02d:%02d ", startHH, startMN, stopHH, stopMN);
+      delay(1200);
+      if (digitalRead(PIN_SET_UP) == HIGH) break;
+    }
+    lcd.clear();
+  }
+}
+
+void view_value() {
+  if (digitalRead(PIN_SET_SAVE) == LOW && editState == 0) {
+    lcd.clear();
+    lcd2.clear();
+    while (digitalRead(PIN_SET_SAVE) == LOW) {
+      //lcd.setCursor(0, 0);
+      //lcd.printf("MODE:%s", gridMode? "PEA" : "INV");
+      lcd.setCursor(0, 0);
+      lcd.printf("MODE MIX 0.034 USEC ");
+      //lcd.printf("%s PEA VOLTS:%.1f ", gridMode? "PEA" : "INV", v3, tempNTC);
+      lcd.setCursor(0, 1);
+      lcd.printf("PEA- VOLTS:%.1fV ", v3);
+      lcd.setCursor(0, 2);
+      lcd.printf("INV- VOLTS:%.1fV ", v1);
+      lcd.setCursor(0, 3);
+      lcd.printf("CURENT:%.1fA", currentAC);
+      delay(1000);
+      if (digitalRead(PIN_SET_SAVE) == HIGH) break;
+    }
+    lcd.clear();
+  }
+}
+
+void handleMagDC_220V() {
+  if (manualBoost) {
+    Serial.println(">>> [MAG 220V]: MANUAL BOOST LOCKED, SKIP AUTO <<<");
+    return;
+  }
+
+  currentAC = readCurrentAC();
+  currentAC = currentAC - 0.5;
+  if (currentAC < 0) {currentAC = 0; }
+  float vBatt = getValue(PIN_V1, MULT_V1);
+
+  bool shouldConnect = (currentAC > PRE_CONNECT_A) && (!gridMode) && (vBatt > BATT_LOW_V);
+
+  if (shouldConnect &&!magConnected) {
+    digitalWrite(PIN_BOOST, HIGH);
+    magConnected = true;
+    magStart = millis();
+    Serial.printf(">>> [MAG 220V]: ON, I=%.1fA Vbatt=%.1fV <<<\n", currentAC, vBatt);
+  }
+
+  bool loadDrop = currentAC < 2.0;
+  bool timeout = millis() - magStart > MAG_HOLD_MS;
+  bool forceOff = gridMode || (vBatt < BATT_LOW_V - 1.0);
+
+  if (magConnected && ((loadDrop && timeout) || forceOff)) {
+    digitalWrite(PIN_BOOST, LOW);
+    magConnected = false;
+    Serial.println(">>> [MAG 220V]: OFF <<<");
+  }
+}
+void showmode(){
+  readSensors(); // <<< อ่านใหม่ตรงนี้เลย ทุกครั้งที่โชว์โหมด
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  if (manualState == true) {
+      if (gridMode == true) {
+        // M-PEA
+
+        /*lcd.printf("M-PEA INV:%.1f", v1);
+        lcd.setCursor(0,1);
+        lcd.printf("Bat%.1 fPEA:%.1f", v2, v3);
+        */
+
+      } else {
+        // M-INV  
+      /* 
+       lcd.printf("M-INV PEA:%.1f", v3);
+        lcd.setCursor(0,1);
+       lcd.printf("Bt%.1f INV:%.1f", v2, v1);
+
+       */
+      }
+  }
+ /* else {
+      lcd2.print("AUTO            ");
+      lcd2.setCursor(0,1);
+      lcd2.print("                ");
+  }
+  */
+}
+void calculateWatt(float v1, float acAmp) {
+   float WATT = acAmp *v1; //   0.055   compesate  CURRENT FROM CT EEROR
+
+    Serial.printf("Power: %.2f Watts\n", WATT); 
+    // ส่งค่าเดียวกันไป MQTT
+   client.publish("saraphi/status/power", String(WATT).c_str(), true);
+   client2.publish("saraphi/status/power", String(WATT).c_str(), true);
+ }
+void loop() {
+  static bool clearDone1 = false;
+  static bool clearDone2 = false;
+  static unsigned long lastLcdBlink = 0;
+  static unsigned long lastWifiTry = 0;
+  static bool lastManualStateDrawn = false;
+  static bool manualStateInit = false;
+  static bool lastGridModeDrawn = true;
+
+  if (WiFi.status()!= WL_CONNECTED && millis() - lastWifiTry > 10000) {
+    lastWifiTry = millis();
+    WiFi.begin(ssid, password);
+    Serial.println(">>> [NET]: Retry WiFi <<<");
+    //lcd.clear();
+  }
+
+  if (!client.connected()) {
+    clearDone1 = false;
+    reconnect();
+  } else if (!clearDone1) {
+    client.publish("saraphi/cmd/reboot", "0", true);
+    delay(50);
+    client.publish("saraphi/cmd/reboot", NULL, true);
+    clearDone1 = true;
+    Serial.println(">>> [LOOP]: Cleared retained reboot on server1 <<<");
+
+    lcd.setCursor(17,2);
+    lcd.printf("M1");
+  }
+
+  if (!client2.connected()) {
+    clearDone2 = false;
+    reconnect();
+  } else if (!clearDone2) {
+    client2.publish("saraphi/cmd/reboot", "0", true);
+    delay(50);
+    client2.publish("saraphi/cmd/reboot", NULL, true);
+    clearDone2 = true;
+    Serial.println(">>> [LOOP]: Cleared retained reboot on server2 <<<");
+
+    lcd.setCursor(19,2);
+    lcd.printf("2 ");
+  }
+
+  client.loop();
+  client2.loop();
+
+  DateTime now = rtc.now();
+  handleTimeSetting();
+
+  if (editState == 0) {
+    checkManualButton();
+    readSensors();
+    handleMagDC_220V();
+
+    if (millis() - lastLcdBlink > 500) {
+      lastLcdBlink = millis();
+      lcd.setCursor(11,2);
+      if (WiFi.status()!= WL_CONNECTED) {
+        lcd.printf("WIFILOST    ");
+        Serial.println(">>WIFI-LOST<<");
+      } else if (!client.connected() &&!client2.connected()) {
+        lcd.setCursor(15,2);
+        lcd.printf("MQOK");
+        Serial.println("MQOK");
+      } else {
+        lcd.setCursor(11,2);
+        lcd.printf("NETOK ");
+      }
+    }
+
+    bool needClear = (!manualStateInit || manualState != lastManualStateDrawn);
+    if (manualState && manualStateInit && (gridMode != lastGridModeDrawn)) {
+      needClear = true; // กันข้อความ MANUAL INV/PEA ปนกัน
+    }
+
+    if (needClear) {
+      lcd.clear(); // ล้างเฉพาะตอนเปลี่ยนโหมด เพื่อลดจอกระพริบ
+      lastManualStateDrawn = manualState;
+      manualStateInit = true;
+      lastGridModeDrawn = gridMode;
+    }
+
+    // แสดงตามสถานะใช้งานจริง: gridMode=true คือฝั่ง PEA
+    String screenModeText = (gridMode == true) ? "BYPASS PEA" : "AUTO";
+    lcd.setCursor(0,0);
+    lcd.printf("%-20s", screenModeText.c_str());
+
+    if (manualState == true) {
+      lcd.setCursor(0,1);
+      lcd.printf("%-20s", screenModeText.c_str());
+      lcd.setCursor(0,2);
+      lcd.printf("%-20s", screenModeText.c_str());
+    } else {
+      runAutoSystem();
+ 
+      lcd.setCursor(0,0);
+      //lcd.printf("     %s T%.1fC ", gridMode? "USE PEA":"USE INV",tempNTC);
+      //lcd.printf("     %s T%.1fC ", gridMode? "USE MIX":"USE INV",tempNTC);
+      lcd.setCursor(0,1);
+
+      
+      lcd.printf("ICT:%.1fA    %02d:%02d:%02d ", currentAC, now.hour(), now.minute(), now.second());
+     // บรรทัดที่ 1118 แก้ไขให้มีตัวแปรครบและปิดวงเล็บ );
+      Serial.printf("36:INV=v1:%.1f, 39:BATT=v2:%.1f, 34:PEA=v3:%.1f, 33:CT:AC:%.1fA, 32:TEMP:%.1f, :%02d:%02d:%02d\n", 
+              v1, v2, v3, currentAC, tempNTC, now.hour(), now.minute(), now.second()); // เพิ่มตัวแปรตัวสุดท้ายและ ) ตรงนี้
+
+      lcd.setCursor(0,2); // บรรทัดนี้จะหาย error ทันที
+      lcd.printf("INV:%.1fV ", v1);
+      lcd.setCursor(0,3);
+      //lcd.printf("B%.1fV PEA: %.1f ",v2,v3);
+      //lcd.printf("PEA: %.1f ",v2,v3);
+      //lcd.printf("PEA:%.1fV BAT%.1fV",v3,v2);
+      lcd.printf("PEA:%.1fV BAT %.1fV",v3,v2);
+       if (manualState == false) {
+          lcd.setCursor(0,0);
+          //lcd.print("AUTO MIX: 0.034 USEC");
+          
+          //lcd.printf("AUTO:34nSEC T%.1fC",tempNTC);
+          //lcd.print("AUTO MIX:34nSEC T%.1fC",tempNTC);
+       }
+    }
+  }
+
+  if (millis() - lastMsg >= 900) {
+    lastMsg = millis();
+    String gStat = gridMode? "PEA" : "INV";
+    char timeBuf[10];
+    sprintf(timeBuf, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+
+
+    // --- 1. สร้างข้อความสถานะแบบละเอียด ---
+    String modeStatus = "";
+    if (manualState == true) {
+      modeStatus = "MANUAL"; // ถ้าเปิดแมนนวล ให้ขึ้น MANUAL เหมือนเดิม
+    } else {
+      // ถ้าเป็น AUTO ให้เช็คต่อว่าตอนนี้สลับไปฝั่งไหนตามสถานะจอภาพหรือสถานะรีเลย์ Bypass
+      if (breakerState == true) {
+        modeStatus = "AUTO USE PEA"; // กระแสเกิน บังคับใช้ไฟหลวง
+      } else {
+        modeStatus = lcdShowSun ? "AUTO USE SUN" : "AUTO USE PEA";
+      }
+    }
+
+    // --- 2. แสดงผลบน Serial Monitor (เปลี่ยนคำว่า manualState?"MANUAL":"AUTO" เป็นสถานะใหม่) ---
+    Serial.printf(">>> [PUBLISH]: boost=%s manualBoost=%d modeStatus=%s V1=%.1f Grid=%s <<<\n", 
+                  magConnected ? "ON" : "OFF", manualBoost, modeStatus.c_str(), v1, gStat.c_str());
+
+    // --- 3. ส่งออกไปยัง Server MQTT ตัวที่ 1 ---
+    if (client.connected()) {
+      client.publish("saraphi/inv/v1", String(v1, 1).c_str());
+      client.publish("saraphi/vbat/v2", String(v2, 1).c_str());
+      client.publish("saraphi/vpia/v3", String(v3, 1).c_str());
+      client.publish("saraphi/temp/ntc", String(tempNTC, 1).c_str());
+      client.publish("saraphi/current/ac", String(currentAC, 1).c_str());
+      
+      // ส่งสถานะละเอียดแบบใหม่ไปแทนที่ gStat หรือส่งคู่กัน (เลือกปรับเปลี่ยนตามต้องการใน Node-RED)
+      client.publish("saraphi/status/grid", modeStatus.c_str()); 
+      
+      client.publish("saraphi/status/boost", magConnected ? "ON" : "OFF");
+      client.publish("saraphi/status/time", timeBuf);
+
+    }
+
+    // --- 4. ส่งออกไปยัง Server MQTT ตัวที่ 2 ---
+    if (client2.connected()) {
+      client2.publish("saraphi/inv/v1", String(v1, 1).c_str());
+      client2.publish("saraphi/vbat/v2", String(v2, 1).c_str());
+      client2.publish("saraphi/vpia/v3", String(v3, 1).c_str());
+      client2.publish("saraphi/temp/ntc", String(tempNTC, 1).c_str());
+      client2.publish("saraphi/current/ac", String(currentAC, 1).c_str());
+      
+      // ส่งสถานะละเอียดแบบใหม่ไปที่ Server ตัวที่ 2 ด้วย
+      client2.publish("saraphi/status/grid", modeStatus.c_str());
+      
+      client2.publish("saraphi/status/boost", magConnected ? "ON" : "OFF");
+      client2.publish("saraphi/status/time", timeBuf);
+    }
+  } // ปิดปีกกาของบล็อกหน่วงเวลาเดิมที่มีอยู่
+  
+  delay(100);
+  view_value2();
+  delay(100);
+  view_value();
+  //showmode();
+  if (millis() - lastRTCPing > 10000) {
+    lastRTCPing = millis();
+    publishRTCTime();    // ส่งเวลานาฬิกา 3231 ออกไปโหนดเร็ด
+    publishTimeStatus(); // ส่งเวลาเริ่ม หยุด ออกไปโหนดเร็ด
+    publishMULV123();
+  }
+
+
+
+
+static unsigned long bypassStartTime = 0;
+
+
+float acAmp = readCurrentAC(); // อ่านค่ากระแส
+acAmp =acAmp-0.3;
+if (acAmp < 0 ) {acAmp=0;}
+// ตัวแปรสำหรับระบบหน่วงเวลา (ต้องประกาศไว้ด้านบนสุดของฟังก์ชัน หรือใช้ static)
+// static unsigned long bypassStartTime = 0; 
+
+// ตั้งเวลาที่จะให้แช่ฝั่ง PEA (10000 มิลลิวินาที = 10 วินาที สำหรับทดสอบ)
+// **ถ้าใช้งานจริง แนะนำให้เปลี่ยนเป็น 300000 (5 นาที) หรือ 600000 (10 นาที) เพื่อถนอม Magnetic**
+const unsigned long BYPASS_HOLD_TIME = 10000; 
+
+/*
+// --- [เงื่อนไขที่ 1: ขาไป PEA] กระแสเกิน และปัจจุบันยังไม่ทำงาน ---
+if (acAmp > ctHighThreshold && breakerState == false) {   
+  Serial.println("กระชาก! สลับไปใช้ไฟ PEA");
+  
+  digitalWrite(PIN_INV, LOW);   // ปิด Inverter
+  delay(100);                   // หน่วงเวลาป้องกัน Contact ชนกัน (Interlock)
+  digitalWrite(PIN_PEA, HIGH);  // เปิดไฟ PEA
+  gridMode = false;
+  breakerState = true;          // อัปเดตสถานะว่ารีเลย์ Bypass ทำงานแล้ว
+  
+  bypassStartTime = millis();   // บันทึกเวลาหน้าปัดนาฬิกา ณ วินาทีที่สับมา PEA
+}
+
+
+// --- [เงื่อนไขที่ 2: ขากลับ Inverter] กระแสลดลง ต่ำกว่าเกณฑ์ และต้องอยู่ PEA จนครบเวลาหน่วงความปลอดภัยแล้วเท่านั้น ---
+if (acAmp < ctLowThreshold && breakerState == true && (millis() - bypassStartTime >= BYPASS_HOLD_TIME)) {        
+  Serial.println("โหลดลดลงและปลอดภัยแล้ว! ปลด Bypass กลับสู่ระบบปกติ");
+
+  digitalWrite(PIN_PEA, LOW);   // ปิดไฟ PEA
+  delay(100);                   // หน่วงเวลาป้องกัน Contact ชนกัน
+  digitalWrite(PIN_INV, HIGH);  // เปิด Inverter
+  gridMode = true;
+  breakerState = false;         // กลับมาโหมดปกติ
+}
+*/
+
+// --- ส่วนคำนวณ Hysteresis ปรับการแสดงผลตามแรงดันแบตเตอรี่ (v2) ---
+if (v2 >= vHighThreshold) {  
+ // lcd.clear();//*****************************************
+
+  lcdShowSun = true;   
+  digitalWrite(PIN_LED_SUN, HIGH);  // เปิดไฟ SUN
+  digitalWrite(PIN_LED_PEA, LOW);   // ปิดไฟ PEA
+  client.publish("saraphi/status/power_source","SUN");
+  client2.publish("saraphi/status/power_source","SUN");
+// แสดงสถานะบน LCD
+  lcd.setCursor(0,0);
+  lcd.print("POWER: SUN       ");
+
+} 
+else {
+  lcdShowSun = false;  
+  digitalWrite(PIN_LED_SUN, LOW);   // ปิดไฟ SUN
+  digitalWrite(PIN_LED_PEA, HIGH);  // เปิดไฟ PEA
+  client.publish("saraphi/status/power_source","PEA");
+  client2.publish("saraphi/status/power_source","PEA");
+ // แสดงสถานะบน LCD
+  lcd.setCursor(0,0);
+  lcd.print("POWER: PEA       ");
+}
+
+
+// --- publish สถานะขึ้นเซิร์ฟเวอร์ ทุกๆ 1 วินาที ---
+static unsigned long lastPub = 0;
+if (millis() - lastPub > 1000) {
+  lastPub = millis();
+  
+  // 1. ส่งสถานะ Boost (โค้ดเดิมของคุณ)
+  const char* st = digitalRead(PIN_BOOST) ? "ON" : "OFF";
+  client.publish("saraphi/status/boost2", st, true);
+  client2.publish("saraphi/status/boost2", st, true);
+
+  // 2. คำนวณวัตต์และส่งไป Node-RED พร้อมกันทุก 1 วินาที (แก้ไขให้ตรงนี้ครับ)
+  float wattValue = acAmp*v1;         // ต้องสร้างและคำนวณตัวแปร wattValue ก่อน
+wattValue = wattValue / 1.62f;   // หาร 2
+
+  char wattString[10];                   // ขนาดอาเรย์ 10 ช่องปลอดภัยตามที่คุณแก้มา
+  dtostrf(wattValue, 6, 2, wattString);  // แปลงเป็นทศนิยม 2 ตำแหน่ง
+  
+  // ส่งค่าวัตต์ไปยัง Node-RED ทีกระชับอยู่ในลูป 1 วินาที
+ // client.publish("saraphi/status/watt", WATT, true);
+  //client2.publish("saraphi/status/watt", WATT, true);
+}
+
+calculateWatt(v1, acAmp); // ฟังก์ชันเดิมของคุณ อยู่นอกลูปปกติ
+}
+
+
+
