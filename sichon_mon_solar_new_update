@@ -1,16 +1,15 @@
 
 
 /*
- NO COOL DOWN  NAKORNSRI work  OK NEW UPDATE AUTO MODE SHARE 34NANOSEC 
- PREVENT RATE OF INVERTER IF OVER CURRENT CT SENSOR BYPASS TO PEA BY ATS 
- SOLAR3FROM6_copy_4-22-2026_09:25:00  use LCD2004 20X4
- -แก้: manualBoost ต้องชนะทุกเงื่อนไข auto
- -แก้: เพิ่ม Serial แจ้งทุกครั้งที่เปลี่ยนสถานะ boost แจ้ง เป็น1 กับว่าง
+  NO COOL DOWN  NAKORNSRI work  OK NEW UPDATE AUTO MODE SHARE 34NANOSEC 
+  can modify PREVENT RATE OF INVERTER IF OVER CURRENT CT SENSOR BYPASS TO PEA BY ATS 
+  use LCD2004 20X
+ -แก้: เพิ่ม publis reboot esp =1
  -แก้: เน็ตล่มให้ LCD แจ้งเตือนบรรทัด 3 ระบบรัน Auto ได้ปกติ ไม่ใช้ while บล็อก
  -แก้: เมนูตั้งค่ากดวนออกได้ ไม่ต้องเซฟ กดค้างออกทันที มี timeout 30วิ
  -แก้: ล้าง retained saraphi/cmd/reboot ทั้งใน setup และ loop กันวนรีบูท
  -ตั้งค่ามาดู และ ดึง อ่านค่า เหล่านี้ mul v1v2v3 vhightvlowv treshold ที่ เคย เขียนลงใน esp32 มา เซ็ตให้เป้นปัจจุบัณ
-  มี ดึงเวลาจาก ds3231 ในตัวแล้ว และ มี เพิ่มวอยด์จาก เมต้า เอไอ ให้ อีก 1 วอยด์ 
+  มี ดึงเวลาจาก ds3231 ในตัวแล้ว
   สาย SCT-013-030 เส้นที่ 1: ต่อเข้า "จุดกึ่งกลาง R 5K" (นี่คือ Virtual Ground ของเราที่ 1.65V)
   สาย SCT-013-030 เส้นที่ 2: ต่อเข้า "Pin 33" ของ ESP32
   กราวด์จริง (GND) ของ ESP32: ไม่ต้อง เอาสายจาก CT ไปต่อลงตรงนั้นครับ (ปล่อยให้มันลอยมาอ้างอิงที่จุด 1.65V แทน)
